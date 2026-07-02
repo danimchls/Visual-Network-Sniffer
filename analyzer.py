@@ -1,34 +1,53 @@
 import threading
+import time
 from collections import defaultdict
-from scapy.all import IP, TCP, UDP, ICMP, ARP
+from scapy.all import IP, TCP, UDP, ICMP, ARP, deque
 
 
 class PortScanDetector:
-    def __init__(self, threshold=15, window_seconds=10):
+    def __init__(self, threshold=10, window_seconds=5):
         self.threshold = threshold
         self.window_seconds = window_seconds
-        self._src_ports = defaultdict(set)
+        # IP origem -> IP destino -> porta destino -> timestamp
+        self._src_ports = defaultdict(lambda: defaultdict(dict))
         self.alerts = []
         self._lock = threading.Lock()
 
     def process_packet(self, pkt):
+        """Guarda o instante que um IP solicitou (SYN) uma porta destino, 
+        e verifica se o número de portas distintas solicitadas por um IP, 
+        em um intervalo de tempo (window_seconds), excede o limiar.
+        """
         if IP not in pkt or TCP not in pkt:
             return
         flags = pkt[TCP].flags
-        if not (flags & 0x02):  # SYN
+        if not (flags & 0x02): # SYN flag is not set
             return
-        if flags & 0x10:       # ACK
+        if flags & 0x10: # ACK flag is set, ignore ACK packets
             return
         src = pkt[IP].src
         dport = pkt[TCP].dport
+        dst= pkt[IP].dst
+
         with self._lock:
-            if src in self._src_ports and dport in self._src_ports[src]:
-                return
-            self._src_ports[src].add(dport)
-            count = len(self._src_ports[src])
-            if count == self.threshold or (count > self.threshold and count % 10 == 0):
+            now = float(pkt.time)
+            
+            ports = self._src_ports[src][dst]
+
+            # Atualiza o instante em que a porta foi acessada
+            ports[dport] = now
+
+            # Remove portas expiradas
+            for port in list(ports.keys()):
+                if now - ports[port] > self.window_seconds:
+                    del ports[port]
+
+            count = len(ports)
+
+            if count >= self.threshold:
                 self.alerts.append(
-                    f"[PORT SCAN] {src} -> {count} portas distintas (SYN)"
+                    f"[PORT SCAN] src:{src} dst:{dst} -> "
+                    f"{count} portas distintas (SYN)"
                 )
 
     def snapshot(self):
@@ -36,82 +55,112 @@ class PortScanDetector:
             alerts = self.alerts[:]
             self.alerts.clear()
         return alerts
-
+    
 
 class SynFloodDetector:
-    def __init__(self, threshold=200, window_seconds=5, completion_ratio=0.5):
+    def __init__(self, threshold=100, window_seconds=5, completion_ratio=0.5):
         self.threshold = threshold
         self.window_seconds = window_seconds
-        self.completion_ratio = completion_ratio
-        self._syn_counts = defaultdict(int)
-        self._ack_counts = defaultdict(int)
+        self.completion_ratio = completion_ratio 
+        # IP origem -> {(IP destino, sport, dport): instante_do_SYN}
+        self._pending_connections = defaultdict(dict)
         self.alerts = []
         self._lock = threading.Lock()
 
     def process_packet(self, pkt):
+        """Guarda o instante que um IP por uma porta (sport) solicitou (SYN) uma porta destino(dport),
+        enquanto aquela requisição não enviar um ACK final a conexão é considerada meio-aberta.
+        Alerta quando o número de conexões meio-abertas (SYN sem ACK) de um IP,
+        em um intervalo de tempo (window_seconds), excede o limiar.
+        """
         if IP not in pkt or TCP not in pkt:
             return
         flags = pkt[TCP].flags
         src = pkt[IP].src
-        
+        sport = pkt[TCP].sport
+        dport = pkt[TCP].dport
+        dst = pkt[IP].dst
+        now = float(pkt.time)
+
         with self._lock:
-            # Count pure SYN packets (SYN without ACK)
-            if (flags & 0x02) and not (flags & 0x10):
-                self._syn_counts[src] += 1
-            # Count ACK packets (connection completions)
-            elif flags & 0x10:
-                self._ack_counts[src] += 1
+            pending = self._pending_connections[src]
+
+            # Remove conexões antigas
+            for conn, timestamp in list(pending.items()):
+                if now - timestamp > self.window_seconds:
+                    del pending[conn]
+
+            # Recebeu um SYN (sem ACK)
+            if flags & 0x02 and not flags & 0x10:
+                pending[(dst, sport, dport)] = now
+
+            # Recebeu o ACK final
+            elif flags & 0x10 and not flags & 0x02:
+                pending.pop((dst, sport, dport), None)
+
+            # Quantidade de conexões meio-abertas
+            half_open = len(pending)
+
+            if half_open >= self.threshold:
+                self.alerts.append(
+                    f"[SYN FLOOD] {src} -> possui "
+                    f"{half_open} conexões meio-abertas. "
+                    f"(limiar={self.threshold})"
+                )
 
     def snapshot(self):
         with self._lock:
-            alerts = []
-            for src in self._syn_counts:
-                syn_count = self._syn_counts[src]
-                ack_count = self._ack_counts.get(src, 0)
-                
-                if syn_count > self.threshold:
-                    ratio = ack_count / syn_count if syn_count > 0 else 0
-                    
-                    if ratio < self.completion_ratio:
-                        alerts.append(
-                            f"[SYN FLOOD] {src} -> {syn_count} SYN, {ack_count} ACK "
-                            f"(taxa={ratio:.2%}, limiar={self.threshold})"
-                        )
-            
-            self._syn_counts.clear()
-            self._ack_counts.clear()
-            self.alerts = alerts
+            alerts = self.alerts[:]
+            self.alerts.clear()
         return alerts
 
 
 class ArpSpoofDetector:
-    def __init__(self):
-        self._ip_mac_map = {}
+    def __init__(self, window_seconds=5):
+        self.window_seconds = window_seconds
+        # IP consultado -> instante do último ARP Request
+        self._pending_requests = {}
         self.alerts = []
         self._lock = threading.Lock()
 
     def process_packet(self, pkt):
+        """Detecta ARP Replies não solicitados, ou seja, quando um IP responde a uma consulta ARP que não foi feita por ele.
+        """
         if ARP not in pkt:
             return
-        op = pkt[ARP].op
-        if op != 2:
-            return
-        psrc = pkt[ARP].psrc
-        hwsrc = pkt[ARP].hwsrc
+
+        arp = pkt[ARP]
+        now = float(pkt.time)
+
         with self._lock:
-            if psrc in self._ip_mac_map and self._ip_mac_map[psrc] != hwsrc:
-                self.alerts.append(
-                    f"[ARP SPOOF] IP {psrc} associado a MACs diferentes: "
-                    f"{self._ip_mac_map[psrc]} e {hwsrc}"
-                )
-            self._ip_mac_map[psrc] = hwsrc
+
+            # Remove requests expirados
+            for ip, timestamp in list(self._pending_requests.items()):
+                if now - timestamp > self.window_seconds:
+                    del self._pending_requests[ip]
+
+            # ARP Request
+            if arp.op == 1:
+                # pdst = IP que está sendo consultado
+                self._pending_requests[arp.pdst] = now
+
+            # ARP Reply
+            elif arp.op == 2:
+                # psrc = IP que está respondendo
+                if arp.psrc not in self._pending_requests:
+                    self.alerts.append(
+                        f"[ARP SPOOF] ARP Reply não solicitado: "
+                        f"tentativa de associar {arp.psrc} ao MAC {arp.hwsrc}"
+                    )
+                else:
+                    # Request atendido
+                    del self._pending_requests[arp.psrc]
 
     def snapshot(self):
         with self._lock:
             alerts = self.alerts[:]
             self.alerts.clear()
         return alerts
-
 
 class IcmpAnalyzer:
     TYPE_NAMES = {
@@ -155,63 +204,28 @@ class TopTalkers:
     def __init__(self, max_entries=10):
         self.max_entries = max_entries
         self._src_counts = defaultdict(int)
-        self._dst_counts = defaultdict(int)
         self._port_counts = defaultdict(int)
-        self._proto_counts = defaultdict(int)
         self._lock = threading.Lock()
 
     def process_packet(self, pkt):
-        if IP not in pkt:
-            if ARP in pkt:
-                with self._lock:
-                    self._proto_counts['ARP'] += 1
+        if IP not in pkt or TCP not in pkt:
             return
-
+                
         with self._lock:
             src = pkt[IP].src
             dst = pkt[IP].dst
-            proto = pkt[IP].proto
+            dstport=pkt[TCP].dport
 
             self._src_counts[src] += 1
-            self._dst_counts[dst] += 1
-
-            if proto == 6:
-                self._proto_counts['TCP'] += 1
-                if TCP in pkt:
-                    self._port_counts[pkt[TCP].dport] += 1
-            elif proto == 17:
-                self._proto_counts['UDP'] += 1
-                if UDP in pkt:
-                    self._port_counts[pkt[UDP].dport] += 1
-            elif proto == 1:
-                self._proto_counts['ICMP'] += 1
-            else:
-                self._proto_counts[f'IP-{proto}'] += 1
-
-    def get_top_sources(self):
-        with self._lock:
-            sorted_ips = sorted(self._src_counts.items(), key=lambda x: x[1], reverse=True)
-            return sorted_ips[:self.max_entries]
-
-    def get_top_ports(self):
-        with self._lock:
-            sorted_ports = sorted(self._port_counts.items(), key=lambda x: x[1], reverse=True)
-            return sorted_ports[:self.max_entries]
-
-    def get_proto_distribution(self):
-        with self._lock:
-            return dict(self._proto_counts)
+            self._port_counts[(dst, dstport)] += 1
 
     def snapshot(self):
         with self._lock:
             top_src = sorted(self._src_counts.items(), key=lambda x: x[1], reverse=True)[:self.max_entries]
             top_ports = sorted(self._port_counts.items(), key=lambda x: x[1], reverse=True)[:self.max_entries]
-            proto_dist = dict(self._proto_counts)
             self._src_counts.clear()
-            self._dst_counts.clear()
             self._port_counts.clear()
-            self._proto_counts.clear()
-        return top_src, top_ports, proto_dist
+        return top_src, top_ports
 
 
 class TtlAnalyzer:
@@ -229,7 +243,7 @@ class TtlAnalyzer:
         self._lock = threading.Lock()
 
     def process_packet(self, pkt):
-        if IP not in pkt:
+        if IP not in pkt or TCP not in pkt:
             return
         ttl = pkt[IP].ttl
         with self._lock:
@@ -248,9 +262,9 @@ class TtlAnalyzer:
 
 class SecurityAnalyzer:
     def __init__(self):
-        self.port_scanner = PortScanDetector(threshold=15, window_seconds=10)
-        self.syn_flood = SynFloodDetector(threshold=200, window_seconds=5)
-        self.arp_spoof = ArpSpoofDetector()
+        self.port_scanner = PortScanDetector(threshold=10, window_seconds=5)
+        self.syn_flood = SynFloodDetector(threshold=50, window_seconds=5)
+        self.arp_spoof = ArpSpoofDetector(window_seconds=10)
         self.icmp = IcmpAnalyzer()
         self.top_talkers = TopTalkers(max_entries=10)
         self.ttl = TtlAnalyzer()
@@ -270,7 +284,7 @@ class SecurityAnalyzer:
         alerts += self.arp_spoof.snapshot()
 
         icmp_stats = self.icmp.snapshot()
-        top_src, top_ports, proto_dist = self.top_talkers.snapshot()
+        top_src, top_ports= self.top_talkers.snapshot()
         ttl_data = self.ttl.snapshot()
 
         return {
@@ -278,6 +292,5 @@ class SecurityAnalyzer:
             'icmp_stats': icmp_stats,
             'top_sources': top_src,
             'top_ports': top_ports,
-            'proto_distribution': proto_dist,
             'ttl_distribution': ttl_data,
         }
